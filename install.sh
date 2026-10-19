@@ -129,7 +129,8 @@ cat > "$BIN.new" <<'PTK_EOF'
 指针模式（四指点按切换）
   单指滑动           相对移动指针
   轻点               左键
-  按住0.22s后移动    拖动（在指针当前位置按下左键）
+  双击               打开（两次左键）
+  双击后按住并移动   拖动（移动时在指针当前位置按下左键）
   按住不动0.6s       右键
 
 用法
@@ -176,8 +177,7 @@ AXIS_RATIO = 0.6        # 主方向 / 次方向 的比例下限（多指滑动�
 HOLD_MS = 0.600         # 长按 -> 右键
 HOLD_MOVE = 12          # 绝对模式长按的静止容差(px)
 POINTER_STILL = 35      # 指针模式长按的静止容差(px)，触摸屏按住时会抖
-DRAG_HOLD = 0.220       # 指针模式按住多久进入拖动预备
-DRAG_MOVE = 5           # 拖动预备后移动多少像素才真正按下左键
+DRAG_MOVE = 5           # 双击第二击后移动多少像素才按下左键（过滤手抖）
 DOUBLE_MS = 0.400       # 双击最大间隔
 DOUBLE_DIST = 30        # 双击允许的位置偏差(px)
 SCROLL_STEP = 18        # 每 18px 发一格滚轮
@@ -424,6 +424,8 @@ class Gesture:
         self.pointer_mode = False    # 四指点按切换
         self.last_tap_t = None
         self.last_tap_xy = None
+        self.p_last_tap_t = None     # 指针模式单击记忆（用于双击 / 双击拖动）
+        self.p_last_tap_xy = None
 
     def reset_counters(self):
         """重置一次触摸过程的计数与标志（不清空 slots）。"""
@@ -441,7 +443,7 @@ class Gesture:
         self.long_pressed = False
         self.prev_xy = None
         self.drag_started = False
-        self.drag_ready = False
+        self.p_drag_armed = False
 
     def reset_touch(self):
         """完全重置（含 slots），用于一次手势结束。"""
@@ -516,6 +518,47 @@ class Gesture:
             self.last_tap_t = now
             self.last_tap_xy = xy
 
+    def _pointer_tap(self, now):
+        """指针模式轻点：不移动指针；第二击在双击窗口内则补成双击。"""
+        xy = self.stable_xy or self.start_xy
+        is_double = (
+            self.p_last_tap_t is not None
+            and self.p_last_tap_xy is not None
+            and now - self.p_last_tap_t < DOUBLE_MS
+            and xy is not None
+            and abs(xy[0] - self.p_last_tap_xy[0]) < DOUBLE_DIST
+            and abs(xy[1] - self.p_last_tap_xy[1]) < DOUBLE_DIST
+        )
+        self.x.click(1)
+        if is_double:
+            self.p_last_tap_t = None
+            self.p_last_tap_xy = None
+            log("指针模式：双击 -> 左键 x2")
+        else:
+            self.p_last_tap_t = now
+            self.p_last_tap_xy = xy
+            log("指针模式：单击 -> 左键")
+
+    def _pointer_arm_double_tap(self):
+        """第二击落在双击窗口内：待命，移动后才按下左键拖动。
+
+        不在按下瞬间按左键，避免快速双击时被误判为拖动；
+        只有第二击之后真的移动了，才进入拖动。
+        """
+        if (self.p_last_tap_t is None or self.p_last_tap_xy is None
+                or self.start_xy is None
+                or self.t_start - self.p_last_tap_t >= DOUBLE_MS):
+            return False
+        c = self.start_xy
+        if (abs(c[0] - self.p_last_tap_xy[0]) >= DOUBLE_DIST
+                or abs(c[1] - self.p_last_tap_xy[1]) >= DOUBLE_DIST):
+            return False
+        # 第二击已确认：清掉单击记忆，避免第三击继续串成拖动
+        self.p_last_tap_t = None
+        self.p_last_tap_xy = None
+        log("指针模式：双击按住（移动即开始拖动）")
+        return True
+
     # ---- 状态推进（每 10ms 调用一次）--------------------------------
     def tick(self, now):
         n = len(self.slots)
@@ -540,21 +583,31 @@ class Gesture:
                 self.state = "gesture"
                 self.start_xy = c
                 self.stable_xy = c
+                self.p_last_tap_t = None
+                self.p_last_tap_xy = None
+                self.p_drag_armed = False
                 log(f"进入手势模式（{n} 指）")
             elif n == 0:
                 # 手指已抬起：只要没移动就当作一次点击
                 #（正常情况下 0.06s 后先进入 pointer；这里是兜底，
                 #  避免某一帧同时"超时 + 抬起"时丢掉点击）
                 if now - self.t_start < TAP_MS and self.max_move < TAP_MOVE:
-                    self.do_tap(now)
+                    if self.pointer_mode:
+                        self._pointer_tap(now)
+                    else:
+                        self.do_tap(now)
                 self.state = "idle"
             elif now - self.t_start >= CLICK_DELAY:
                 self.state = "pointer"
                 self.pointer_start = now
                 if self.pointer_mode:
-                    # 指针模式：不按下、不跳位置，只记录起点
+                    # 指针模式：不按下、不跳位置，只记录起点。
+                    # 若这是双击的第二击，则先待命，移动后才开始拖动。
                     self.prev_xy = c
-                    log("指针模式：开始移动指针")
+                    self.stable_xy = c
+                    self.p_drag_armed = self._pointer_arm_double_tap()
+                    log("指针模式：开始移动指针"
+                        + ("（双击拖动待命）" if self.p_drag_armed else ""))
                     return
                 self.dragging = True
                 self._press_at(now, c)
@@ -565,6 +618,12 @@ class Gesture:
                 if self.dragging:
                     self.x.button(1, False)
                     self.dragging = False
+                if self.drag_started:
+                    self.x.button(1, False)
+                    self.drag_started = False
+                self.p_drag_armed = False
+                self.p_last_tap_t = None
+                self.p_last_tap_xy = None
                 self.state = "gesture"
                 self.max_fingers = max(self.max_fingers, n)
                 self.start_xy = c
@@ -623,9 +682,15 @@ class Gesture:
                 self.x.button(1, False)
                 self.drag_started = False
                 log(f"指针模式：拖动结束（{dur:.2f}s）")
-            elif dur < TAP_MS and self.max_move < TAP_MOVE:
+            elif self.p_drag_armed:
+                # 双击的第二击：没有移动，补上第二下点击
+                self.p_drag_armed = False
+                self.p_last_tap_t = None
+                self.p_last_tap_xy = None
                 self.x.click(1)
-                log(f"指针模式：单击（{dur:.2f}s）")
+                log("指针模式：双击 -> 左键 x2")
+            elif dur < TAP_MS and self.max_move < TAP_MOVE:
+                self._pointer_tap(now)
             elif self.long_pressed:
                 log("指针模式：右键结束")
             self.prev_xy = None
@@ -659,8 +724,21 @@ class Gesture:
             self.x.move(*c)
 
     def _pointer_move(self, now, c):
-        """指针模式：相对移动 + 拖动预备/开始 + 长按右键。"""
+        """指针模式：相对移动 + 双击按住拖动 + 长按右键。"""
         dur = now - self.pointer_start
+
+        if c:
+            self.stable_xy = c
+
+        # 双击第二击后移动了 -> 先按下左键，再应用这一帧位移，
+        # 保证拖动起点就在双击位置。单指普通滑动永远不会按下左键。
+        if (self.p_drag_armed
+                and not self.drag_started
+                and self.max_move > DRAG_MOVE):
+            self.x.button(1, True)
+            self.drag_started = True
+            self.p_drag_armed = False
+            log("指针模式：开始拖动（左键已按下）")
 
         if self.prev_xy and c:
             dx = c[0] - self.prev_xy[0]
@@ -669,29 +747,15 @@ class Gesture:
                 self.x.move_rel(dx * POINTER_GAIN, dy * POINTER_GAIN)
         self.prev_xy = c
 
-        # 按住不动 0.22s -> 拖动预备（先不按左键，避免长按右键时误拖）
-        if (not self.drag_ready
-                and not self.long_pressed
-                and dur >= DRAG_HOLD
-                and self.max_move < POINTER_STILL):
-            self.drag_ready = True
-            log("指针模式：拖动预备")
-
-        # 预备后真的移动了 -> 这时才按下左键
-        if (self.drag_ready
-                and not self.drag_started
-                and not self.long_pressed
-                and self.max_move > DRAG_MOVE):
-            self.x.button(1, True)
-            self.drag_started = True
-            log("指针模式：开始拖动（左键已按下）")
-
-        # 一直不动到 0.6s -> 右键（已经开始拖动则不再触发）
+        # 一直不动到 0.6s -> 右键（双击待命/拖动中不触发）
         if (not self.long_pressed
                 and not self.drag_started
+                and not self.p_drag_armed
                 and dur >= HOLD_MS
                 and self.max_move < POINTER_STILL):
             self.long_pressed = True
+            self.p_last_tap_t = None
+            self.p_last_tap_xy = None
             self.x.click(3)
             log(f"指针模式：长按 -> 右键（{dur:.2f}s）")
 
