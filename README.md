@@ -24,7 +24,8 @@ sudo bash install.sh --uninstall
 - 写入 `/usr/local/bin/ptk-touch-gesture`
 - 写入 `/etc/xdg/autostart/pocketterm35-touch-gesture.desktop`（登录自动启动）
 - 缺少时自动安装 `xdotool`、`wmctrl`、`x11-xserver-utils`
-- 立即启动守护进程
+- 将桌面用户加入 `input` 组（读取触屏设备所需，下次登录生效）
+- 立即以该用户身份启动守护进程
 
 **不改动** `/boot`、X 配置、桌面环境、分辨率、DPI、登录设置。
 卸载后触摸屏恢复系统默认行为（单指点击）。

@@ -24,13 +24,57 @@ fi
 BIN=/usr/local/bin/ptk-touch-gesture
 DESKTOP=/etc/xdg/autostart/pocketterm35-touch-gesture.desktop
 
-stop_daemon() {
-    for p in $(pgrep -f "ptk-touch-gesture" 2>/dev/null); do
-        cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null || true)
-        case "$cmd" in
-            python3*) kill "$p" 2>/dev/null || true ;;
+# 桌面用户：autostart 和立即启动都以该用户身份运行
+RUN_USER="${SUDO_USER:-}"
+if [ -z "$RUN_USER" ] || [ "$RUN_USER" = "root" ]; then
+    RUN_USER=$(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $1; exit}')
+fi
+
+# 守护进程的实际 cmdline 是 "python3 /usr/local/bin/ptk-touch-gesture"。
+# 不能只用 pgrep -f 匹配整条命令行：一个恰好包含该字符串的 shell/编辑器
+# 也会被误杀。这里解析 /proc/PID/cmdline，要求 argv[0] 是 python 且某个
+# 参数正好等于 $BIN。
+daemon_pids() {
+    local p arg
+    local -a argv
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        mapfile -d '' -t argv < "/proc/$p/cmdline" 2>/dev/null || continue
+        [ ${#argv[@]} -ge 2 ] || continue
+        case "${argv[0]##*/}" in
+            python*) ;;
+            *) continue ;;
         esac
+        for arg in "${argv[@]:1}"; do
+            if [ "$arg" = "$BIN" ]; then
+                echo "$p"
+                break
+            fi
+        done
+    done < <(pgrep -f "$BIN" 2>/dev/null || true)
+}
+
+stop_daemon() {
+    local pids=() p alive
+    while IFS= read -r p; do
+        [ -n "$p" ] && pids+=("$p")
+    done < <(daemon_pids)
+
+    [ ${#pids[@]} -gt 0 ] || return 0
+    kill "${pids[@]}" 2>/dev/null || true
+    for _ in {1..20}; do
+        alive=0
+        for p in "${pids[@]}"; do
+            kill -0 "$p" 2>/dev/null && alive=1
+        done
+        [ "$alive" -eq 0 ] && return 0
+        sleep 0.1
     done
+    kill -9 "${pids[@]}" 2>/dev/null || true
+}
+
+daemon_pid() {
+    daemon_pids | head -1
 }
 
 # ---------------- 卸载 ----------------
@@ -50,6 +94,15 @@ if [ ${#need[@]} -gt 0 ]; then
     echo "安装依赖：${need[*]}"
     apt-get update -qq 2>/dev/null || true
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${need[@]}"
+fi
+
+# 触屏设备通常是 root:input 0660。登录后 autostart 以桌面用户身份运行，
+# 该用户必须在 input 组里，否则 os.open("/dev/input/eventN") 会 EACCES。
+if [ -n "$RUN_USER" ] && getent group input >/dev/null 2>&1; then
+    if ! id -nG "$RUN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx input; then
+        usermod -aG input "$RUN_USER"
+        echo "已将 $RUN_USER 加入 input 组（下次登录生效）"
+    fi
 fi
 
 # ---------------- 安装守护 ----------------
@@ -779,20 +832,57 @@ EOF
 
 # ---------------- 立即启动 ----------------
 stop_daemon
-sleep 0.5
-RUN_USER="${SUDO_USER:-}"
-if [ -z "$RUN_USER" ]; then
-    RUN_USER=$(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $1; exit}')
-fi
-if [ -n "${RUN_USER:-}" ] && [ -S /tmp/.X11-unix/X0 ]; then
-    sudo -u "$RUN_USER" env DISPLAY=:0.0 \
-        XAUTHORITY="/home/$RUN_USER/.Xauthority" \
-        setsid nohup "$BIN" >/dev/null 2>&1 &
-    sleep 1
+sleep 0.2
+
+# 找到当前 X display（sudo 可能保留也可能清掉 DISPLAY）
+XDISPLAY=""
+case "${DISPLAY:-}" in
+    :*)
+        _d="${DISPLAY#:}"
+        _d="${_d%%.*}"
+        [ -S "/tmp/.X11-unix/X$_d" ] && XDISPLAY="$DISPLAY"
+        ;;
+esac
+if [ -z "$XDISPLAY" ]; then
+    for _s in /tmp/.X11-unix/X*; do
+        [ -S "$_s" ] || continue
+        XDISPLAY=":${_s##*/X}.0"
+        break
+    done
 fi
 
-if pgrep -f "python3 $BIN" >/dev/null 2>&1; then
-    echo "已启动（PID $(pgrep -f "python3 $BIN" | head -1)）"
+# 找到该用户的 Xauthority
+XAUTH=""
+if [ -n "$RUN_USER" ]; then
+    RUN_HOME=$(getent passwd "$RUN_USER" | awk -F: '{print $6}')
+    for _cand in "${XAUTHORITY:-}" "$RUN_HOME/.Xauthority" \
+                 "/run/user/$(id -u "$RUN_USER")/gdm/Xauthority"; do
+        if [ -n "$_cand" ] && [ -r "$_cand" ] \
+                && sudo -u "$RUN_USER" test -r "$_cand" 2>/dev/null; then
+            XAUTH="$_cand"
+            break
+        fi
+    done
+fi
+
+if [ -n "${RUN_USER:-}" ] && [ -n "$XDISPLAY" ]; then
+    env_args=("DISPLAY=$XDISPLAY")
+    [ -n "$XAUTH" ] && env_args+=("XAUTHORITY=$XAUTH")
+
+    # 刚 usermod 的组在当前会话里还没生效，用 -g input 立即获得设备权限。
+    group_args=()
+    getent group input >/dev/null 2>&1 && group_args=(-g input)
+
+    sudo -u "$RUN_USER" "${group_args[@]}" env "${env_args[@]}" \
+        setsid nohup "$BIN" >/dev/null 2>&1 < /dev/null &
+    for _ in {1..30}; do
+        [ -n "$(daemon_pid)" ] && break
+        sleep 0.1
+    done
+fi
+
+if [ -n "$(daemon_pid)" ]; then
+    echo "已启动（PID $(daemon_pid)）"
 else
     echo "提示：守护未立即启动，登录桌面后会自动拉起"
 fi
